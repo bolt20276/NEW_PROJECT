@@ -178,76 +178,208 @@ def score_cv(cv_text, jd_text):
     return round(similarity * 100)
 
 # --- Streamlit UI ---
-st.title("📄 AI Resume Analyzer")
-email_user = st.text_input("Email Address")
-email_pass = st.text_input("Email Password (App Password)", type="password")
-subject_filter = st.text_input("Filter by Subject or Keyword (Optional)")
-days_back = st.slider("Only check emails from the past X days", min_value=1, max_value=90, value=30)
-max_emails = st.slider("Max emails to fetch", min_value=10, max_value=100, value=50)
+def main_page():
+    st.title("📄 AI Resume Analyzer")
+    email_user = st.text_input("Email Address")
+    email_pass = st.text_input("Email Password (App Password)", type="password")
+    subject_filter = st.text_input("Filter by Subject or Keyword (Optional)")
+    days_back = st.slider("Only check emails from the past X days", min_value=1, max_value=90, value=30)
+    max_emails = st.slider("Max emails to fetch", min_value=10, max_value=100, value=50)
 
-st.markdown("### Job Description")
-jd_text = st.text_area("Paste Job Description", height=200)
-uploaded_jd = st.file_uploader("Or upload Job Description (PDF/DOCX)", type=["pdf", "docx"])
-if uploaded_jd is not None:
-    jd_text = extract_text_from_pdf(uploaded_jd.read()) if uploaded_jd.name.endswith(".pdf") else extract_text_from_docx(uploaded_jd.read())
+    st.markdown("### Job Description")
+    jd_text = st.text_area("Paste Job Description", height=200)
+    uploaded_jd = st.file_uploader("Or upload Job Description (PDF/DOCX/TXT)", type=["pdf", "docx", "txt"])
+    
+    if uploaded_jd is not None:
+        file_content = uploaded_jd.read()
+        if uploaded_jd.name.lower().endswith(".pdf"):
+            jd_text = extract_text_from_pdf(file_content)
+        elif uploaded_jd.name.lower().endswith(".docx"):
+            jd_text = extract_text_from_docx(file_content)
+        elif uploaded_jd.name.lower().endswith(".txt"):
+            jd_text = file_content.decode("utf-8", errors='ignore')
+        else:
+            st.error("Unsupported file type")
+            jd_text = ""
 
-jd_responsibilities = extract_responsibilities(jd_text)
+    if st.button("Fetch & Analyze Resumes"):
+        if not email_user or not email_pass or not jd_text.strip():
+            st.error("Fill all fields.")
+        else:
+            with st.spinner("Processing resumes..."):
+                seen_hashes = set()
+                results = []
+                attachments = fetch_attachments(email_user, email_pass, subject_filter, days_back, max_emails)
+                
+                for fname, content, subject in attachments:
+                    ext = os.path.splitext(fname)[1].lower()
+                    cv_text = extract_text_from_pdf(content) if ext == ".pdf" else extract_text_from_docx(content)
+                    cv_text = clean_text(cv_text)
+                    if len(cv_text) < 100:
+                        continue
+                    hash_val = hash_text(cv_text)
+                    if hash_val in seen_hashes:
+                        continue
+                    seen_hashes.add(hash_val)
 
-if st.button("Fetch & Analyze Resumes"):
-    if not email_user or not email_pass or not jd_text.strip():
-        st.error("Fill all fields.")
+                    score = score_cv(cv_text, jd_text)
+                    name = extract_name(cv_text)
+                    email_addr = extract_email(cv_text)
+                    skills = extract_skills(cv_text)
+                    certs = extract_certifications(cv_text)
+                    edu = extract_education(cv_text)
+                    exp = extract_experience(cv_text)
+                    jd_responsibilities = extract_responsibilities(jd_text)
+                    matched = [r for r in jd_responsibilities if r.lower() in cv_text.lower()]
+
+                    pdf_path = export_cv_to_pdf({"Name": name, "RawText": cv_text})
+                    with open(pdf_path, "rb") as f:
+                        encoded = base64.b64encode(f.read()).decode()
+                    download_link = f'<a href="data:application/pdf;base64,{encoded}" download="{pdf_path}">Download PDF</a>'
+
+                    results.append({
+                        "Name": name,
+                        "Email": email_addr,
+                        "Score": score,
+                        "Experience": exp,
+                        "Skills": ", ".join(skills),
+                        "Certifications": ", ".join(certs),
+                        "Education": ", ".join(edu),
+                        "Responsibilities Matched": ", ".join(matched),
+                        "File": download_link,
+                        "Subject": subject,
+                    })
+
+                if results:
+                    df = pd.DataFrame(results)
+                    # Store results in session state
+                    st.session_state.results_df = df
+                    st.session_state.show_results = True
+                    st.rerun()
+                else:
+                    st.warning("No valid resumes found.")
+
+def results_page():
+    st.title("📊 Analysis Results")
+    
+    if 'results_df' not in st.session_state:
+        st.warning("No results found. Please analyze resumes first.")
+        if st.button("Back to Main Page"):
+            st.session_state.show_results = False
+            st.rerun()
+        return
+
+    df = st.session_state.results_df
+    
+    # Add interactive filters
+    st.sidebar.header("Filters")
+    min_score = st.sidebar.slider("Minimum Score", 0, 100, 0)
+    min_experience = st.sidebar.slider("Minimum Experience (years)", 0, 50, 0)
+    
+    filtered_df = df[
+        (df['Score'] >= min_score) &
+        (df['Experience'] >= min_experience)
+    ]
+
+    # Main results layout
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Candidates", len(df))
+    with col2:
+        st.metric("Average Score", f"{df['Score'].mean():.1f}")
+    with col3:
+        st.metric("Top Score", df['Score'].max())
+
+    # Search bar
+    search_term = st.text_input("Search candidates by name, skills, or keywords:")
+    if search_term:
+        filtered_df = filtered_df[
+            filtered_df.apply(lambda row: any(
+                search_term.lower() in str(row[col]).lower() 
+                for col in ['Name', 'Skills', 'Certifications', 'Education', 'Responsibilities Matched']
+            ), axis=1)
+        ]
+
+    # Interactive dataframe with all columns
+    st.subheader("Ranked Candidates")
+    edited_df = st.dataframe(
+        filtered_df[['Name', 'Score', 'Experience', 'Skills', 'Certifications', 
+                    'Education', 'Responsibilities Matched', 'Email']],
+        use_container_width=True,
+        height=600,
+        column_config={
+            "Score": st.column_config.ProgressColumn(
+                "Score",
+                help="Match score percentage",
+                format="%d%%",
+                min_value=0,
+                max_value=100,
+            ),
+            "Experience": st.column_config.NumberColumn(
+                "Experience (years)",
+                help="Years of professional experience",
+                format="%d yr",
+            ),
+            "Skills": st.column_config.ListColumn(
+                "Key Skills",
+                help="Top skills identified",
+            ),
+            "Certifications": st.column_config.ListColumn(
+                "Certifications",
+                help="Professional certifications",
+            ),
+            "Education": st.column_config.ListColumn(
+                "Education",
+                help="Educational qualifications",
+            ),
+            "Responsibilities Matched": st.column_config.ListColumn(
+                "Matched Responsibilities",
+                help="Job responsibilities matched from JD",
+            )
+        }
+    )
+
+    # Candidate details expander
+    st.subheader("Candidate Details")
+    for idx, candidate in filtered_df.iterrows():
+        with st.expander(f"{candidate['Name']} - Score: {candidate['Score']}%"):
+            col1, col2 = st.columns([1, 3])
+            
+            with col1:
+                st.markdown(f"**Email:** {candidate['Email']}")
+                st.markdown(f"**Experience:** {candidate['Experience']} years")
+                st.markdown(f"**Certifications:** {candidate['Certifications']}")
+                st.markdown(f"**Education:** {candidate['Education']}")
+                st.markdown(candidate['File'], unsafe_allow_html=True)
+                
+            with col2:
+                st.markdown("**Matched Responsibilities**")
+                st.write(candidate['Responsibilities Matched'])
+                
+                st.markdown("**Email Subject**")
+                st.write(candidate['Subject'])
+
+    # Download button
+    st.download_button(
+        label="Download Full Results CSV",
+        data=filtered_df.drop(columns=["File"]).to_csv(index=False).encode("utf-8"),
+        file_name="filtered_results.csv",
+        mime="text/csv"
+    )
+
+    if st.button("Back to Main Page"):
+        st.session_state.show_results = False
+        st.rerun()
+        
+# Main app flow
+if __name__ == "__main__":
+    if 'show_results' not in st.session_state:
+        st.session_state.show_results = False
+
+    if st.session_state.show_results:
+        results_page()
     else:
-        with st.spinner("Processing resumes..."):
-            seen_hashes = set()
-            results = []
-            attachments = fetch_attachments(email_user, email_pass, subject_filter, days_back, max_emails)
-            for fname, content, subject in attachments:
-                ext = os.path.splitext(fname)[1].lower()
-                cv_text = extract_text_from_pdf(content) if ext == ".pdf" else extract_text_from_docx(content)
-                cv_text = clean_text(cv_text)
-                if len(cv_text) < 100:
-                    continue
-                hash_val = hash_text(cv_text)
-                if hash_val in seen_hashes:
-                    continue
-                seen_hashes.add(hash_val)
-
-                score = score_cv(cv_text, jd_text)
-                name = extract_name(cv_text)
-                email_addr = extract_email(cv_text)
-                skills = extract_skills(cv_text)
-                certs = extract_certifications(cv_text)
-                edu = extract_education(cv_text)
-                exp = extract_experience(cv_text)
-                matched = [r for r in jd_responsibilities if r.lower() in cv_text.lower()]
-
-                pdf_path = export_cv_to_pdf({"Name": name, "RawText": cv_text})
-                with open(pdf_path, "rb") as f:
-                    encoded = base64.b64encode(f.read()).decode()
-                download_link = f'<a href="data:application/pdf;base64,{encoded}" download="{pdf_path}">Download PDF</a>'
-
-                results.append({
-                    "Name": name,
-                    "Email": email_addr,
-                    "Score": score,
-                    "Experience": exp,
-                    "Skills": ", ".join(skills),
-                    "Certifications": ", ".join(certs),
-                    "Education": ", ".join(edu),
-                    "Responsibilities Matched": ", ".join(matched),
-                    "File": download_link,
-                    "Subject": subject,
-                })
-
-            if results:
-                df = pd.DataFrame(results)
-                st.write("### Ranked Candidates")
-                st.write(df.to_html(escape=False), unsafe_allow_html=True)
-
-                csv = df.drop(columns=["File"]).to_csv(index=False).encode("utf-8")
-                st.download_button("Download Results CSV", csv, "ranked_results.csv")
-            else:
-                st.warning("No valid resumes found.")
+        main_page()
 
 
 
